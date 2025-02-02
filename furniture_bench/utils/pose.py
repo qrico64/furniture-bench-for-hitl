@@ -40,6 +40,29 @@ def mat_to_roll_pitch_yaw(rmat):
     return roll, pitch, yaw
 
 
+def euler_from_quaternion(quat_angle):
+    """
+    Convert a quaternion into euler angles (roll, pitch, yaw)
+    roll is rotation around x in radians (counterclockwise)
+    pitch is rotation around y in radians (counterclockwise)
+    yaw is rotation around z in radians (counterclockwise)
+    """
+    x = quat_angle[0]; y = quat_angle[1]; z = quat_angle[2]; w = quat_angle[3]
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = np.arctan2(t0, t1)
+    
+    t2 = +2.0 * (w * y - z * x)
+    t2 = np.clip(t2, -1, 1)
+    pitch_y = np.arcsin(t2)
+    
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = np.arctan2(t3, t4)
+    
+    return roll_x, pitch_y, yaw_z # in radians
+
+
 def merge_mat(pos_mat: List[float], rot_mat):
     transform = np.zeros((4, 4), dtype=np.float32)
     transform[:3, :3] = rot_mat

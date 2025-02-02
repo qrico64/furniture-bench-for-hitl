@@ -14,3 +14,4 @@ class SquareTableLeg(Leg):
         self.reset_gripper_width = 0.06
         self.grasp_margin_x = 0
         self.grasp_margin_z = 0
+        self.no_more_movement = False

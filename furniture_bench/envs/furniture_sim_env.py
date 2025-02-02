@@ -32,7 +32,7 @@ from furniture_bench.controllers.osc import osc_factory
 from furniture_bench.furniture import furniture_factory
 from furniture_bench.sim_config import sim_config
 from furniture_bench.config import ROBOT_HEIGHT, config
-from furniture_bench.utils.pose import get_mat, rot_mat
+from furniture_bench.utils.pose import get_mat, rot_mat, euler_from_quaternion
 from furniture_bench.envs.observation import (
     FULL_OBS,
     DEFAULT_VISUAL_OBS,
@@ -69,6 +69,7 @@ class FurnitureSimEnv(gym.Env):
         record: bool = False,
         max_env_steps: int = 3000,
         act_rot_repr: str = "quat",
+        assembly_action_randomness: bool = True,
         **kwargs,
     ):
         """
@@ -92,6 +93,8 @@ class FurnitureSimEnv(gym.Env):
             record (bool): If true, videos of the wrist and front cameras' RGB inputs are recorded.
             max_env_steps (int): Maximum number of steps per episode (default: 3000).
             act_rot_repr (str): Representation of rotation for action space. Options are 'quat', 'axis', or 'rot_6d'.
+            assembly_action_randomness (bool): Whether to include randomness when generating scripted assembly actions
+            action_space_bounds: low and high of action space
         """
         super(FurnitureSimEnv, self).__init__()
         self.device = torch.device("cuda", compute_device_id)
@@ -135,6 +138,7 @@ class FurnitureSimEnv(gym.Env):
         self.grasp_margin = 0.02 - 0.001  # To prevent repeating open an close actions.
         self.max_gripper_width = config["robot"]["max_gripper_width"][furniture]
         self.gripper_pos_control = kwargs.get("gripper_pos_control", False)
+        self.assembly_action_randomness = assembly_action_randomness
 
         self.save_camera_input = save_camera_input
         self.img_size = sim_config["camera"][
@@ -1417,129 +1421,152 @@ class FurnitureSimEnv(gym.Env):
 
     def get_assembly_action(self) -> torch.Tensor:
         """Scripted furniture assembly logic.
-
         Returns:
             Tuple (action for the assembly task, skill complete mask)
         """
-        assert self.num_envs == 1  # Only support one environment for now.
+        # assert self.num_envs == 1  # Only support one environment for now.
         if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
             raise NotImplementedError("[one_leg, cabinet, lamp, round_table] are supported for scripted agent")
+        
+        if self.act_rot_repr == "quat":
+            pose_dim = 7
+        elif self.act_rot_repr == "rot_6d":
+            pose_dim = 9
+        else: # axis
+            pose_dim = 6
 
-        if self.assemble_idx > len(self.furniture.should_be_assembled):
-            return torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], device=self.device)
+        actions = torch.zeros((self.num_envs, pose_dim + 1), device=self.device)
+        # import pdb; pdb.set_trace()
+        for env_idx in range(self.num_envs):
+            #TODO(simi): hardcoded for lamp fix
+            if self.assemble_idx >= len(self.furnitures[env_idx].should_be_assembled) or self.furnitures[env_idx].parts[1].no_more_movement:
+                if self.act_rot_repr == "axis":
+                    actions[env_idx] = torch.tensor([0, 0, 0, 0, 0, 0, 1], device=self.device)
+                else:
+                    actions[env_idx] = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1], device=self.device)
+                continue
 
-        ee_pos, ee_quat = self.get_ee_pose()
-        gripper_width = self.gripper_width()
-        ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+            ee_pos, ee_quat = self.get_ee_pose()
+            gripper_width = self.gripper_width()
 
-        if self.move_neutral:
-            if ee_pos[2] <= 0.15 - 0.01:
-                gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
-                goal_pos = torch.tensor(
-                    [ee_pos[0], ee_pos[1], 0.15], device=self.device
+            # import pdb; pdb.set_trace()
+            ee_pos, ee_quat = ee_pos[env_idx].squeeze(), ee_quat[env_idx].squeeze()
+            if self.move_neutral:
+                if ee_pos[2] <= 0.15 - 0.01:
+                    gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
+                    goal_pos = torch.tensor(
+                        [ee_pos[0], ee_pos[1], 0.15], device=self.device
+                    )
+                    delta_pos = goal_pos - ee_pos
+                    delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)
+                    actions[env_idx] = torch.concat([delta_pos, delta_quat, gripper])
+                    # return action.unsqueeze(0), 0
+                else:
+                    self.move_neutral = False
+            part_idx1, part_idx2 = self.furnitures[env_idx].should_be_assembled[self.assemble_idx]
+            part1 = self.furnitures[env_idx].parts[part_idx1]
+            part1_name = self.furnitures[env_idx].parts[part_idx1].name
+            part1_pose = C.to_homogeneous(
+                self.rb_states[self.part_idxs[part1_name]][env_idx][:3],
+                C.quat2mat(self.rb_states[self.part_idxs[part1_name]][env_idx][3:7]),
+            )
+            part2 = self.furnitures[env_idx].parts[part_idx2]
+            part2_name = self.furnitures[env_idx].parts[part_idx2].name
+            part2_pose = C.to_homogeneous(
+                self.rb_states[self.part_idxs[part2_name]][env_idx][:3],
+                C.quat2mat(self.rb_states[self.part_idxs[part2_name]][env_idx][3:7]),
+            )
+            rel_pose = torch.linalg.inv(part1_pose) @ part2_pose
+            assembled_rel_poses = self.furnitures[env_idx].assembled_rel_poses[(part_idx1, part_idx2)]
+            if self.furnitures[env_idx].assembled(rel_pose.cpu().numpy(), assembled_rel_poses):
+                self.assemble_idx += 1
+                self.move_neutral = True
+                actions[env_idx] = torch.tensor(
+                        [0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device
+                    )
+                # return (
+                #     torch.tensor(
+                #         [0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device
+                #     ).unsqueeze(0),
+                #     1,
+                # )  # Skill complete is always 1 when assembled.
+            if not part1.pre_assemble_done:
+                goal_pos, goal_ori, gripper, skill_complete = part1.pre_assemble(
+                    # env_idx,
+                    ee_pos,
+                    ee_quat,
+                    gripper_width[env_idx],
+                    self.rb_states,
+                    self.part_idxs,
+                    self.sim_to_april_mat,
+                    self.april_to_robot_mat,
                 )
-                delta_pos = goal_pos - ee_pos
-                delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)
-                action = torch.concat([delta_pos, delta_quat, gripper])
-                return action.unsqueeze(0), 0
+            elif not part2.pre_assemble_done:
+                goal_pos, goal_ori, gripper, skill_complete = part2.pre_assemble(
+                    # env_idx,
+                    ee_pos,
+                    ee_quat,
+                    gripper_width[env_idx],
+                    self.rb_states,
+                    self.part_idxs,
+                    self.sim_to_april_mat,
+                    self.april_to_robot_mat,
+                )
             else:
-                self.move_neutral = False
-        part_idx1, part_idx2 = self.furniture.should_be_assembled[self.assemble_idx]
+                goal_pos, goal_ori, gripper, skill_complete = self.furnitures[env_idx].parts[
+                    part_idx2
+                ].fsm_step(
+                    env_idx,
+                    ee_pos,
+                    ee_quat,
+                    gripper_width[env_idx],
+                    self.rb_states,
+                    self.part_idxs,
+                    self.sim_to_april_mat,
+                    self.april_to_robot_mat,
+                    self.furnitures[env_idx].parts[part_idx1].name,
+                )
 
-        part1 = self.furniture.parts[part_idx1]
-        part1_name = self.furniture.parts[part_idx1].name
-        part1_pose = C.to_homogeneous(
-            self.rb_states[self.part_idxs[part1_name]][0][:3],
-            C.quat2mat(self.rb_states[self.part_idxs[part1_name]][0][3:7]),
-        )
-        part2 = self.furniture.parts[part_idx2]
-        part2_name = self.furniture.parts[part_idx2].name
-        part2_pose = C.to_homogeneous(
-            self.rb_states[self.part_idxs[part2_name]][0][:3],
-            C.quat2mat(self.rb_states[self.part_idxs[part2_name]][0][3:7]),
-        )
-        rel_pose = torch.linalg.inv(part1_pose) @ part2_pose
-        assembled_rel_poses = self.furniture.assembled_rel_poses[(part_idx1, part_idx2)]
-        if self.furniture.assembled(rel_pose.cpu().numpy(), assembled_rel_poses):
-            self.assemble_idx += 1
-            self.move_neutral = True
-            return (
-                torch.tensor(
-                    [0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device
-                ).unsqueeze(0),
-                1,
-            )  # Skill complete is always 1 when assembled.
-        if not part1.pre_assemble_done:
-            goal_pos, goal_ori, gripper, skill_complete = part1.pre_assemble(
-                ee_pos,
-                ee_quat,
-                gripper_width,
-                self.rb_states,
-                self.part_idxs,
-                self.sim_to_april_mat,
-                self.april_to_robot_mat,
-            )
-        elif not part2.pre_assemble_done:
-            goal_pos, goal_ori, gripper, skill_complete = part2.pre_assemble(
-                ee_pos,
-                ee_quat,
-                gripper_width,
-                self.rb_states,
-                self.part_idxs,
-                self.sim_to_april_mat,
-                self.april_to_robot_mat,
-            )
-        else:
-            goal_pos, goal_ori, gripper, skill_complete = self.furniture.parts[
-                part_idx2
-            ].fsm_step(
-                ee_pos,
-                ee_quat,
-                gripper_width,
-                self.rb_states,
-                self.part_idxs,
-                self.sim_to_april_mat,
-                self.april_to_robot_mat,
-                self.furniture.parts[part_idx1].name,
-            )
+            delta_pos = goal_pos - ee_pos
+            # Scale translational action.
+            delta_pos_sign = delta_pos.sign()
+            delta_pos = torch.abs(delta_pos) * 2
+            for i in range(3):
+                if delta_pos[i] > 0.03:
+                    delta_pos[i] = 0.03 + (delta_pos[i] - 0.03) * np.random.normal(1.5, 0.1)
+            delta_pos = delta_pos * delta_pos_sign
+            # Clamp too large action.
+            max_delta_pos = 0.11 + 0.01 * torch.rand(3, device=self.device)
+            max_delta_pos[2] -= 0.04
+            delta_pos = torch.clamp(delta_pos, min=-max_delta_pos, max=max_delta_pos)
+            delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
+            # Add random noise to the action.
+            if self.assembly_action_randomness:
+                if (
+                    self.furnitures[env_idx].parts[part_idx2].state_no_noise()
+                    and np.random.random() < 0.50
+                ):
+                    delta_pos = torch.normal(delta_pos, 0.005)
+                    delta_quat = C.quat_multiply(
+                        delta_quat,
+                        torch.tensor(
+                            T.axisangle2quat(
+                                [
+                                    np.radians(np.random.normal(0, 5)),
+                                    np.radians(np.random.normal(0, 5)),
+                                    np.radians(np.random.normal(0, 5)),
+                                ]
+                            ),
+                            device=self.device,
+                        ),
+                    ).to(self.device)
 
-        delta_pos = goal_pos - ee_pos
-
-        # Scale translational action.
-        delta_pos_sign = delta_pos.sign()
-        delta_pos = torch.abs(delta_pos) * 2
-        for i in range(3):
-            if delta_pos[i] > 0.03:
-                delta_pos[i] = 0.03 + (delta_pos[i] - 0.03) * np.random.normal(1.5, 0.1)
-        delta_pos = delta_pos * delta_pos_sign
-
-        # Clamp too large action.
-        max_delta_pos = 0.11 + 0.01 * torch.rand(3, device=self.device)
-        max_delta_pos[2] -= 0.04
-        delta_pos = torch.clamp(delta_pos, min=-max_delta_pos, max=max_delta_pos)
-
-        delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
-        # Add random noise to the action.
-        if (
-            self.furniture.parts[part_idx2].state_no_noise()
-            and np.random.random() < 0.50
-        ):
-            delta_pos = torch.normal(delta_pos, 0.005)
-            delta_quat = C.quat_multiply(
-                delta_quat,
-                torch.tensor(
-                    T.axisangle2quat(
-                        [
-                            np.radians(np.random.normal(0, 5)),
-                            np.radians(np.random.normal(0, 5)),
-                            np.radians(np.random.normal(0, 5)),
-                        ]
-                    ),
-                    device=self.device,
-                ),
-            ).to(self.device)
-        action = torch.concat([delta_pos, delta_quat, gripper])
-        return action.unsqueeze(0), skill_complete
+            if self.act_rot_repr == "axis":
+                delta_axis = torch.tensor(euler_from_quaternion(delta_quat.cpu()), device=self.device)
+                actions[env_idx] = torch.concat([delta_pos, delta_axis, gripper])
+            else:
+                actions[env_idx] = torch.concat([delta_pos, delta_quat, gripper])
+        return actions, torch.zeros((self.num_envs, ), device=self.device)
 
     def assembly_success(self):
         return self._done().squeeze()

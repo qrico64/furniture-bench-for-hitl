@@ -69,6 +69,7 @@ class Leg(Part):
 
     def fsm_step(
         self,
+        env_idx,
         ee_pos,
         ee_quat,
         gripper_width,
@@ -89,12 +90,12 @@ class Leg(Part):
 
         ee_pose = C.to_homogeneous(ee_pos, C.quat2mat(ee_quat))
         table_pose = C.to_homogeneous(
-            rb_states[part_idxs[assemble_to]][0][:3],
-            C.quat2mat(rb_states[part_idxs[assemble_to]][0][3:7]),
+            rb_states[part_idxs[assemble_to]][env_idx][:3],
+            C.quat2mat(rb_states[part_idxs[assemble_to]][env_idx][3:7]),
         )
         leg_pose = C.to_homogeneous(
-            rb_states[part_idxs[self.name]][0][:3],
-            C.quat2mat(rb_states[part_idxs[self.name]][0][3:7]),
+            rb_states[part_idxs[self.name]][env_idx][:3],
+            C.quat2mat(rb_states[part_idxs[self.name]][env_idx][3:7]),
         )
 
         table_pose = sim_to_april_mat @ table_pose
@@ -106,8 +107,8 @@ class Leg(Part):
         def find_leg_pose_x_look_front(leg_pose):
             best_leg_pose = leg_pose.clone()
             tmp_leg_pose = leg_pose
-            rot = rot_mat_tensor(0, -np.pi / 2, 0, device)
-            for i in range(3):
+            rot = rot_mat_tensor(0, -np.pi / 4, 0, device)
+            for i in range(7):
                 tmp_leg_pose = tmp_leg_pose @ rot
                 if best_leg_pose[0, 0] < tmp_leg_pose[0, 0]:
                     best_leg_pose = tmp_leg_pose
@@ -122,17 +123,19 @@ class Leg(Part):
             target_pos = (april_to_robot @ pos)[:3]
             # target_ori = (margin @ april_to_robot @ rot)[:3, :3]
             target_ori = ee_pose[:3, :3]
-            target_pos[2] = ee_pos[2]
-            target_pos[1] += 0.01
+            rot = rot_mat_tensor(np.pi / 2, -np.pi / 2, 0, device)
+            target_ori = (margin @ april_to_robot @ rot)[:3, :3]
+            target_pos[2] = 0.10 # max(ee_pos[2], 0.25)
+            # target_pos[1] += 0.01
             target_pos[0] += self.grasp_margin_x
             target = self.add_noise_first_target(
                 C.to_homogeneous(target_pos, target_ori),
                 ori_noise=torch.tensor([0, 0, 0, 1], device=device),
             )
-            if self.satisfy(ee_pose, target, pos_error_threshold=0.02):
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.02, max_len=50):
                 self.prev_pose = target.clone()
                 self.prev_pose[2, 3] -= 0.02
-                next_state = "reach_leg_ori"
+                next_state = "reach_leg_floor_z"
         elif self._state == "reach_leg_ori":
             rot = rot_mat_tensor(np.pi / 2, -np.pi / 2, 0, device)
             target_ori = (margin @ april_to_robot @ rot)[:3, :3]
@@ -146,7 +149,7 @@ class Leg(Part):
             target_pos[2] = (april_to_robot @ leg_pose)[2, 3]
             target_ori = self.prev_pose[:3, :3]
             target = C.to_homogeneous(target_pos, target_ori)
-            if self.satisfy(ee_pose, target, pos_error_threshold=0.007):
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.01, max_len=20):
                 self.prev_pose = target
                 next_state = "pick_leg"
         elif self._state == "pick_leg":
@@ -154,7 +157,7 @@ class Leg(Part):
             self.gripper_action = 1
             if self.gripper_less(gripper_width, 2 * self.half_width + 0.001):
                 self.prev_pose = target
-                next_state = "lift_up"
+                next_state = "reach_table_top_xy"
         elif self._state == "lift_up":
             target_pos = self.prev_pose[:3, 3] + torch.tensor(
                 [0, 0, 0.10], device=device
@@ -167,7 +170,7 @@ class Leg(Part):
                 ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
             ):
                 self.prev_pose = target
-                next_state = "move_center"
+                next_state = "reach_table_top_xy"
         elif self._state == "move_center":
             target_pos = torch.tensor([0.5, 0.1, 0.1], device=device)
             target_ori = self.prev_pose[:3, :3]
@@ -181,12 +184,12 @@ class Leg(Part):
                 next_state = "match_leg_ori"
         elif self._state == "match_leg_ori":
             target_ori = (margin @ rot_mat_tensor(np.pi, 0, 0, device))[:3, :3]
-            target_pos = torch.tensor([0.57, 0.1, 0.12], device=device)
+            target_pos = self.prev_pose[:3, 3] # torch.tensor([0.57, 0.1, 0.12], device=device)
             target = self.add_noise_first_target(
                 C.to_homogeneous(target_pos, target_ori)
             )
             if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
+                ee_pose, target, pos_error_threshold=0.05, ori_error_threshold=0.3
             ):
                 self.prev_pose = target
                 next_state = "reach_table_top_xy"
@@ -201,6 +204,10 @@ class Leg(Part):
                     device=device,
                 )
             )
+            
+            target_pos = torch.tensor([table_hole_pose_robot[0, 3], table_hole_pose_robot[1, 3], 0.10], device=device)
+            # import pdb; pdb.set_trace()
+            target_ori = (margin @ rot_mat_tensor(np.pi, 0, 0, device))[:3, :3]
             target_leg_pose_robot = torch.tensor(
                 [
                     [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
@@ -212,8 +219,12 @@ class Leg(Part):
             )
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
             target = rel @ ee_pose
+
+            target = C.to_homogeneous(target_pos, target_ori)
+            
+
             if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3
+                ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.3
             ):
                 self.prev_pose = target
                 next_state = "reach_table_top_z"
@@ -232,7 +243,7 @@ class Leg(Part):
                 [
                     [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
                     [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3]],
-                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.09],
+                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.07],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
                 device=device,
@@ -240,9 +251,10 @@ class Leg(Part):
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
             target = rel @ ee_pose
             if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15
+                ee_pose, target, pos_error_threshold=0.012, ori_error_threshold=0.15
             ):
                 self.prev_pose = target
+                self.no_more_movement = True
                 next_state = "insert_wait"
         elif self._state == "insert_wait":
             leg_pose_robot = april_to_robot @ leg_pose
